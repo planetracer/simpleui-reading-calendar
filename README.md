@@ -43,8 +43,24 @@ koreader/plugins/
 
 Restart KOReader.
 
-Either way, the module appears on your homescreen (you can position or
-disable it from SimpleUI's Arrange/module settings, id `reading_calendar`).
+### Add it to your homescreen
+
+Installing registers the module with SimpleUI but does **not** place it —
+you choose where it goes:
+
+1. Open SimpleUI's settings menu.
+2. Go to **Modules → Edit Layout**.
+3. Swipe to the page where you want the calendar (a page of its own works
+   best — the calendar sizes itself to fill the visible area).
+4. Tap **Add Module** and pick **Reading Calendar**.
+
+You can move or remove it later from the same layout editor. If your
+homescreen still uses the default layout (you never customized it), the
+module may simply appear at the end without this step.
+
+The calendar automatically fits your screen: day cells use book-cover
+proportions when there is room and shrink so the whole month always fits
+the visible area, whatever the device or orientation.
 
 ## Interactions
 

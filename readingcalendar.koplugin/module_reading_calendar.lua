@@ -497,12 +497,37 @@ function M.build(w, ctx)
     end
 
     -- ── Calendar grid ────────────────────────────────────────────────────
-    local cell_h = math.floor(cell_w * 1.5)
     local row_gap = math.max(3, Screen:scaleBySize(5))
     local ndays = daysInMonth(y, m)
     local first_wday = os.date("*t", os.time{ year = y, month = m, day = 1, hour = 12 }).wday -- 1=Sun
     local start_wday = week_starts_monday and 2 or 1
     local lead = (first_wday - start_wday) % 7
+    local nrows = math.ceil((lead + ndays) / 7)
+
+    -- Fit to screen: cover aspect (1.5 × width) is the ceiling, but when the
+    -- full grid would overflow the homescreen's visible content area the
+    -- cells shrink so header + stats + day names + all rows fit on one page.
+    local header_gap = Size.padding.default
+    local hs_for_h = ctx and ctx._hs_widget
+    local ok_core, core = pcall(require, "sui_core")
+    core = ok_core and core or nil
+    local content_h = (hs_for_h and hs_for_h._layout_content_h)
+        or (core and core.getContentHeight and core.getContentHeight())
+        or math.floor(Screen:getHeight() * 0.8)
+    -- Spacing the homescreen inserts above the module: the per-module gap
+    -- (default MOD_GAP), plus one extra MOD_GAP when the top bar is off.
+    local mod_gap = (core and core.MOD_GAP) or Screen:scaleBySize(23)
+    local gap_px = (Config and Config.getModuleGapPx
+        and Config.getModuleGapPx("reading_calendar", pfx, mod_gap)) or mod_gap
+    local overhead = gap_px + mod_gap
+    local fixed_h = header:getSize().h + header_gap
+        + stats_row:getSize().h + header_gap
+        + dayname_row:getSize().h + math.floor(header_gap / 2)
+    local grid_budget = content_h - overhead - fixed_h
+    local cell_h = math.floor(cell_w * 1.5)
+    local fit_h = math.floor(grid_budget / nrows) - row_gap
+    if fit_h < cell_h then cell_h = fit_h end
+    cell_h = math.max(cell_h, math.floor(cell_w * 0.6))
 
     local day_face        = Font:getFace(face_reg, fs_day)
     local cover_slots     = {}
@@ -563,7 +588,6 @@ function M.build(w, ctx)
     end
 
     -- ── Assemble ─────────────────────────────────────────────────────────
-    local header_gap = Size.padding.default
     local body = VerticalGroup:new{
         align = "left",
         header,
@@ -672,11 +696,13 @@ function M.updateCovers(widget, _ctx)
     return all_done
 end
 
--- Rough height estimate for layout previews (real height comes from build()).
+-- Rough height estimate for layout previews (real height comes from build(),
+-- which fits itself to the visible content area — so cap the estimate too).
 function M.getHeight(ctx)
     local w = (ctx and (ctx.col_w or ctx.inner_w)) or Screen:getWidth()
     local cell_w = math.floor(w / 7)
-    return math.floor(cell_w * 1.5 * 6 + w * 0.35)
+    local est = math.floor(cell_w * 1.5 * 6 + w * 0.35)
+    return math.min(est, math.floor(Screen:getHeight() * 0.9))
 end
 
 -- Drops the month cache so fresh stats are fetched on the next build.
