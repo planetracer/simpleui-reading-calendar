@@ -4,20 +4,33 @@ A month-view calendar for the [SimpleUI](https://github.com/doctorhetfield-cmd/s
 homescreen. Every day you read shows the **cover(s) of the book(s) you read
 that day** — when you read multiple books in one day, the covers **stack**
 with a small fanned offset. Days without reading show a plain day number.
+Tap a day to see that day's books — covers, authors, pages and time — and
+tap a book to open it. The calendar automatically sizes itself to fit your
+screen.
 
-A stats strip at the top shows the month's totals:
+<p align="center">
+  <img src="screenshots/calendar.png" width="46%" alt="Reading Calendar on the SimpleUI homescreen">
+  &nbsp;
+  <img src="screenshots/day-popup.png" width="46%" alt="Day popup listing that day's books">
+</p>
 
-```
-        2026
-        JULY
-  27      2987      272
- BOOKS    PAGES   PAGES/DAY
-```
+## Stats strip
 
-The columns are configurable (long-press the module → **Statistics**):
-**BOOKS**, **PAGES**, **PAGES/DAY**, **TIME**, **TIME/DAY**, **DAYS** (days
-read this month) and **STREAK** (current consecutive-day reading streak).
-Per-day averages divide by the number of days you actually read.
+The header shows month stats in configurable columns (long-press the
+module → **Statistics** and toggle any combination):
+
+| Stat | Meaning |
+| --- | --- |
+| **BOOKS** | Distinct books read this month |
+| **PAGES** | Total pages read this month |
+| **PAGES/DAY** | Pages divided by the number of days you actually read |
+| **TIME** | Total reading time this month |
+| **TIME/DAY** | Reading time divided by days you actually read |
+| **DAYS** | Number of days you read this month |
+| **STREAK** | Current consecutive-day reading streak (not month-bound; a day with no pages yet doesn't break it until midnight) |
+
+The default is BOOKS · PAGES · PAGES/DAY. Columns re-space automatically
+for however many stats you enable.
 
 All data comes from KOReader's built-in statistics database — nothing extra
 to track. Covers come from SimpleUI's cover cache.
