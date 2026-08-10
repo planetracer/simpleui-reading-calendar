@@ -31,6 +31,7 @@ local GestureRange    = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan  = require("ui/widget/horizontalspan")
 local InputContainer  = require("ui/widget/container/inputcontainer")
+local LeftContainer   = require("ui/widget/container/leftcontainer")
 local LuaSettings     = require("luasettings")
 local OverlapGroup    = require("ui/widget/overlapgroup")
 local SQ3             = require("lua-ljsqlite3/init")
@@ -151,6 +152,7 @@ local function fetchMonthData(y, m)
         days      = {},   -- day number (1..31) → sorted list of book entries
         books     = 0,
         pages     = 0,
+        dur       = 0,
         days_read = 0,
     }
     _month_cache[key] = data
@@ -201,6 +203,7 @@ local function fetchMonthData(y, m)
                 end
                 list[#list + 1] = entry
                 data.pages = data.pages + entry.pages
+                data.dur   = data.dur + entry.dur
                 if entry.id_book and not distinct_books[entry.id_book] then
                     distinct_books[entry.id_book] = true
                     data.books = data.books + 1
@@ -214,6 +217,76 @@ local function fetchMonthData(y, m)
     end
     pcall(function() conn:close() end)
     return data
+end
+
+-- ---------------------------------------------------------------------------
+-- Current reading streak (consecutive days ending today / yesterday)
+-- ---------------------------------------------------------------------------
+
+local _streak_cache  -- { mtime, streak }, invalidated when the DB changes
+
+local function currentStreak()
+    local mtime = dbMtime()
+    if _streak_cache and _streak_cache.mtime == mtime then
+        return _streak_cache.streak
+    end
+    local streak = 0
+    if lfs.attributes(db_path, "mode") == "file" then
+        local ok_open, conn = pcall(SQ3.open, db_path)
+        if ok_open and conn then
+            local read_days = {}
+            pcall(function()
+                local stmt = conn:prepare([[
+                    SELECT DISTINCT strftime('%Y-%m-%d', start_time, 'unixepoch', 'localtime') AS d
+                    FROM page_stat ORDER BY d DESC LIMIT 1200;
+                ]])
+                for row in stmt:rows() do read_days[row[1]] = true end
+                stmt:close()
+            end)
+            pcall(function() conn:close() end)
+            local t = os.time()
+            -- No pages yet today: the streak is still alive, count from yesterday.
+            if not read_days[os.date("%Y-%m-%d", t)] then t = t - 86400 end
+            while read_days[os.date("%Y-%m-%d", t)] do
+                streak = streak + 1
+                t = t - 86400
+            end
+        end
+    end
+    _streak_cache = { mtime = mtime, streak = streak }
+    return streak
+end
+
+-- ---------------------------------------------------------------------------
+-- Configurable stats strip
+-- ---------------------------------------------------------------------------
+
+local SK_STATS = "rcal_stats"
+
+local STAT_DEFS = {
+    { key = "books",     label = _("BOOKS"),     value = function(d) return d.books end },
+    { key = "pages",     label = _("PAGES"),     value = function(d) return d.pages end },
+    { key = "pages_day", label = _("PAGES/DAY"), value = function(d)
+          return d.days_read > 0 and math.floor(d.pages / d.days_read + 0.5) or 0 end },
+    { key = "time",      label = _("TIME"),      value = function(d) return fmtDuration(d.dur) end },
+    { key = "time_day",  label = _("TIME/DAY"),  value = function(d)
+          return fmtDuration(d.days_read > 0 and math.floor(d.dur / d.days_read + 0.5) or 0) end },
+    { key = "days",      label = _("DAYS"),      value = function(d) return d.days_read end },
+    { key = "streak",    label = _("STREAK"),    value = function() return currentStreak() end },
+}
+local STAT_DEFAULT = { "books", "pages", "pages_day" }
+
+-- Returns the enabled stat defs in STAT_DEFS order (at least one).
+local function enabledStats(S, pfx)
+    local keys = (S and S:readSetting(pfx .. SK_STATS)) or STAT_DEFAULT
+    local set = {}
+    for _i, k in ipairs(keys) do set[k] = true end
+    local out = {}
+    for _i, def in ipairs(STAT_DEFS) do
+        if set[def.key] then out[#out + 1] = def end
+    end
+    if #out == 0 then out[1] = STAT_DEFS[1] end
+    return out
 end
 
 -- ---------------------------------------------------------------------------
@@ -289,13 +362,14 @@ end
 -- Widget builders
 -- ---------------------------------------------------------------------------
 
-local function makeText(text, face, fgcolor, bold)
+local function makeText(text, face, fgcolor, bold, max_width)
     return TextWidget:new{
-        text    = text,
-        face    = face,
-        bold    = bold,
-        fgcolor = fgcolor or Blitbuffer.COLOR_BLACK,
-        padding = 0,
+        text      = text,
+        face      = face,
+        bold      = bold,
+        fgcolor   = fgcolor or Blitbuffer.COLOR_BLACK,
+        padding   = 0,
+        max_width = max_width,
     }
 end
 
@@ -324,8 +398,15 @@ local function makeCoverStack(day_books, cell_w, cell_h, max_stack, cover_slots)
     local SH = getSH()
     local n = math.min(#day_books, max_stack)
     local off = n > 1 and math.max(2, math.floor(cell_w * 0.10)) or 0
-    local cover_w = cell_w - off * (n - 1)
-    local cover_h = cell_h - off * (n - 1)
+    -- Box left for one cover once the stack offsets are subtracted.
+    local box_w = cell_w - off * (n - 1)
+    local box_h = cell_h - off * (n - 1)
+    -- Keep book proportions (2:3): when fit-to-screen squashes cells the box
+    -- gets wider than 2:3 — narrow the cover instead of cropping its art.
+    local cover_h = box_h
+    local cover_w = math.min(box_w, math.floor(box_h / 1.5 + 0.5))
+    -- Center the whole fanned pile horizontally in the cell.
+    local base_x = math.floor((cell_w - (cover_w + off * (n - 1))) / 2)
 
     local group = OverlapGroup:new{
         dimen = Geom:new{ w = cell_w, h = cell_h },
@@ -338,7 +419,7 @@ local function makeCoverStack(day_books, cell_w, cell_h, max_stack, cover_slots)
         local fp = fileForMd5(entry.md5)
         local cover
         if fp and SH then
-            cover = SH.getBookCover(fp, cover_w, cover_h, "center", 0.30)
+            cover = SH.getBookCover(fp, cover_w, cover_h, "center", 0.15)
         end
         if not cover and SH then
             cover = SH.coverPlaceholder(entry.title, nil, cover_w, cover_h)
@@ -351,7 +432,7 @@ local function makeCoverStack(day_books, cell_w, cell_h, max_stack, cover_slots)
                 VerticalSpan:new{ width = 0 },
             }
         end
-        local dx = (i - 1) * off
+        local dx = base_x + (i - 1) * off
         local dy = (n - i) * off
         cover.overlap_offset = { dx, dy }
         group[#group + 1] = cover
@@ -361,7 +442,7 @@ local function makeCoverStack(day_books, cell_w, cell_h, max_stack, cover_slots)
                 w         = cover_w,
                 h         = cover_h,
                 align     = "center",
-                stretch   = 0.30,
+                stretch   = 0.15,
                 container = group,
                 idx       = #group,
                 offset    = { dx, dy },
@@ -371,24 +452,154 @@ local function makeCoverStack(day_books, cell_w, cell_h, max_stack, cover_slots)
     return group
 end
 
--- Popup listing one day's books.
-local function showDayPopup(y, m, day, day_books)
-    local lines = {}
+-- Rich popup for one day: cover, title, author, pages and time per book.
+-- Tap a book row to open that book; tap outside the sheet to dismiss.
+local MAX_POPUP_ROWS = 6
+
+local function showDayPopup(y, m, day, day_books, ctx, month_names)
+    local Style = getStyle()
+    local SH    = getSH()
+    local sw, sh = Screen:getWidth(), Screen:getHeight()
+
+    local face_reg  = Style and Style.FACE_REGULAR or "cfont"
+    local face_bold = Style and Style.FACE_BOLD or "tfont"
+    local fs_head = math.max(14, math.floor((Style and Style.FS_SUBTITLE or 20) * 1.1))
+    local fs_row  = math.max(12, (Style and Style.FS_DETAIL or 15))
+    local fs_meta = math.max(10, (Style and Style.FS_CAPTION or 12))
+
+    local head_face = Font:getFace(face_bold, fs_head)
+    local row_face  = Font:getFace(face_bold, fs_row)
+    local meta_face = Font:getFace(face_reg, fs_meta)
+
+    local pad     = Size.padding.fullscreen
+    local popup_w = math.floor(sw * 0.88)
+    local inner_w = popup_w - 2 * pad
+    local row_pad = Size.padding.default
+
+    local th_h = math.floor(sh * 0.085)
+    local th_w = math.floor(th_h / 1.5 + 0.5)
+
+    local popup  -- forward declaration for row closures
+
+    local LineWidget
+    do
+        local okl, lw = pcall(require, "ui/widget/linewidget")
+        if okl then LineWidget = lw end
+    end
+    local function separator()
+        if LineWidget then
+            return LineWidget:new{
+                dimen      = Geom:new{ w = inner_w, h = Size.line.thin },
+                background = Blitbuffer.COLOR_GRAY,
+            }
+        end
+        return VerticalSpan:new{ width = row_pad }
+    end
+
+    local content = VerticalGroup:new{ align = "center" }
+
+    -- Header: "10 AUGUST" over the year.
+    content[#content + 1] = makeText(
+        string.format("%d %s", day, month_names[m]), head_face, Blitbuffer.COLOR_BLACK, true, inner_w)
+    content[#content + 1] = makeText(tostring(y), meta_face, Blitbuffer.COLOR_DARK_GRAY)
+    content[#content + 1] = VerticalSpan:new{ width = row_pad }
+
     local total_pages, total_dur = 0, 0
-    for _i, b in ipairs(day_books) do
+    local shown = math.min(#day_books, MAX_POPUP_ROWS)
+    for bi, b in ipairs(day_books) do
         total_pages = total_pages + b.pages
         total_dur   = total_dur + b.dur
-        lines[#lines + 1] = string.format("%s\n    %d %s · %s",
-            b.title, b.pages, _("pages"), fmtDuration(b.dur))
+        if bi <= shown then
+            local fp = fileForMd5(b.md5)
+            local cover
+            if SH then
+                if fp then cover = SH.getBookCover(fp, th_w, th_h, "center", 0.15) end
+                if not cover then cover = SH.coverPlaceholder(b.title, b.authors, th_w, th_h) end
+            end
+
+            local text_w = inner_w - (cover and (th_w + row_pad) or 0)
+            local col = VerticalGroup:new{ align = "left" }
+            col[#col + 1] = makeText(b.title, row_face, Blitbuffer.COLOR_BLACK, true, text_w)
+            if b.authors and b.authors ~= "" then
+                col[#col + 1] = makeText(b.authors, meta_face, Blitbuffer.COLOR_DARK_GRAY, false, text_w)
+            end
+            col[#col + 1] = VerticalSpan:new{ width = math.floor(row_pad / 2) }
+            col[#col + 1] = makeText(
+                string.format("%d %s · %s", b.pages, _("pages"), fmtDuration(b.dur)),
+                meta_face, Blitbuffer.COLOR_DARK_GRAY, false, text_w)
+
+            local hg = HorizontalGroup:new{ align = "center" }
+            if cover then
+                hg[#hg + 1] = cover
+                hg[#hg + 1] = HorizontalSpan:new{ width = row_pad }
+            end
+            hg[#hg + 1] = col
+
+            local row_h = math.max(cover and th_h or 0, col:getSize().h) + row_pad
+            local row = InputContainer:new{
+                dimen = Geom:new{ w = inner_w, h = row_h },
+                LeftContainer:new{
+                    dimen = Geom:new{ w = inner_w, h = row_h },
+                    hg,
+                },
+            }
+            if fp then
+                local _fp = fp
+                row.ges_events = {
+                    TapBook = { GestureRange:new{ ges = "tap", range = function() return row.dimen end } },
+                }
+                function row:onTapBook()
+                    UIManager:close(popup)
+                    local opened = false
+                    if ctx and type(ctx.open_fn) == "function" then
+                        opened = pcall(ctx.open_fn, _fp)
+                    end
+                    if not opened then
+                        pcall(function() require("apps/reader/readerui"):showReader(_fp) end)
+                    end
+                    return true
+                end
+            end
+
+            if bi > 1 then content[#content + 1] = separator() end
+            content[#content + 1] = row
+        end
     end
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = string.format("%s: %d %s · %s",
-        _("Total"), total_pages, _("pages"), fmtDuration(total_dur))
-    local InfoMessage = require("ui/widget/infomessage")
-    UIManager:show(InfoMessage:new{
-        text = string.format("%04d-%02d-%02d\n\n%s", y, m, day, table.concat(lines, "\n")),
-        show_icon = false,
-    })
+    if #day_books > shown then
+        content[#content + 1] = makeText(
+            string.format(_("+ %d more"), #day_books - shown),
+            meta_face, Blitbuffer.COLOR_DARK_GRAY)
+    end
+
+    if #day_books > 1 then
+        content[#content + 1] = separator()
+        content[#content + 1] = VerticalSpan:new{ width = math.floor(row_pad / 2) }
+        content[#content + 1] = makeText(
+            string.format("%s · %d %s · %s", _("TOTAL"), total_pages, _("pages"), fmtDuration(total_dur)),
+            meta_face, Blitbuffer.COLOR_BLACK, true, inner_w)
+    end
+
+    local frame = FrameContainer:new{
+        background = Blitbuffer.COLOR_WHITE,
+        bordersize = Size.border.window,
+        radius     = Size.radius.window,
+        padding    = pad,
+        content,
+    }
+    popup = InputContainer:new{
+        dimen = Geom:new{ x = 0, y = 0, w = sw, h = sh },
+        CenterContainer:new{ dimen = Geom:new{ w = sw, h = sh }, frame },
+    }
+    popup.ges_events = {
+        TapClose = { GestureRange:new{ ges = "tap", range = Geom:new{ x = 0, y = 0, w = sw, h = sh } } },
+    }
+    function popup:onTapClose(_arg, ges)
+        if frame.dimen and ges.pos:notIntersectWith(frame.dimen) then
+            UIManager:close(popup, "ui")
+        end
+        return true
+    end
+    UIManager:show(popup, "ui")
 end
 
 -- ---------------------------------------------------------------------------
@@ -461,17 +672,15 @@ function M.build(w, ctx)
         CenterContainer:new{ dimen = Geom:new{ w = w, h = month_w:getSize().h }, month_w },
     }
 
-    -- ── Stats strip ──────────────────────────────────────────────────────
-    local per_day = data.days_read > 0 and math.floor(data.pages / data.days_read + 0.5) or 0
-    local col_w = math.floor(w / 3)
+    -- ── Stats strip (columns are user-configurable, see getMenuItems) ────
+    local stat_defs = enabledStats(S, pfx)
+    local col_w = math.floor(w / #stat_defs)
     local val_face = Font:getFace(face_bold, fs_value)
     local lbl_face = Font:getFace(face_reg, fs_caption)
-    local stats_row = HorizontalGroup:new{
-        align = "top",
-        makeStatCol(data.books, _("BOOKS"),     col_w, val_face, lbl_face),
-        makeStatCol(data.pages, _("PAGES"),     col_w, val_face, lbl_face),
-        makeStatCol(per_day,    _("PAGES/DAY"), col_w, val_face, lbl_face),
-    }
+    local stats_row = HorizontalGroup:new{ align = "top" }
+    for _i, def in ipairs(stat_defs) do
+        stats_row[#stats_row + 1] = makeStatCol(def.value(data), def.label, col_w, val_face, lbl_face)
+    end
 
     -- ── Weekday names ────────────────────────────────────────────────────
     local gap = math.max(2, Screen:scaleBySize(3))
@@ -649,7 +858,7 @@ function M.build(w, ctx)
             local days_row = weeks_days[row]
             local day = days_row and days_row[colidx]
             if day and data.days[day] then
-                showDayPopup(y, m, day, data.days[day])
+                showDayPopup(y, m, day, data.days[day], ctx, MONTH_NAMES)
                 return true
             end
         end
@@ -717,7 +926,37 @@ function M.getMenuItems(ctx_menu)
     if not Config or not S then return nil end
     local pfx = ctx_menu.pfx
     local refresh = ctx_menu.refresh
+    local stats_sub = {}
+    for _i, def in ipairs(STAT_DEFS) do
+        local key = def.key
+        stats_sub[#stats_sub + 1] = {
+            text = def.label,
+            checked_func = function()
+                local keys = S:readSetting(pfx .. SK_STATS) or STAT_DEFAULT
+                for _k, k in ipairs(keys) do
+                    if k == key then return true end
+                end
+                return false
+            end,
+            keep_menu_open = true,
+            callback = function()
+                local keys = S:readSetting(pfx .. SK_STATS) or STAT_DEFAULT
+                local out, found = {}, false
+                for _k, k in ipairs(keys) do
+                    if k == key then found = true else out[#out + 1] = k end
+                end
+                if not found then out[#out + 1] = key end
+                S:set(pfx .. SK_STATS, out)
+                if refresh then refresh() end
+            end,
+        }
+    end
+
     local items = {
+        {
+            text = _("Statistics"),
+            sub_item_table = stats_sub,
+        },
         {
             text = _("Start week on Monday"),
             checked_func = function() return S:isTrue(pfx .. SK_WEEK_MONDAY) end,

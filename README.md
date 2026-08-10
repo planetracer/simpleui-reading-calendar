@@ -14,7 +14,10 @@ A stats strip at the top shows the month's totals:
  BOOKS    PAGES   PAGES/DAY
 ```
 
-`PAGES/DAY` is pages divided by the number of days you actually read.
+The columns are configurable (long-press the module → **Statistics**):
+**BOOKS**, **PAGES**, **PAGES/DAY**, **TIME**, **TIME/DAY**, **DAYS** (days
+read this month) and **STREAK** (current consecutive-day reading streak).
+Per-day averages divide by the number of days you actually read.
 
 All data comes from KOReader's built-in statistics database — nothing extra
 to track. Covers come from SimpleUI's cover cache.
@@ -69,7 +72,8 @@ the visible area, whatever the device or orientation.
 | Swipe left / right on the calendar | Next / previous month |
 | Tap left / right side of the header | Previous / next month |
 | Tap the month name | Jump back to the current month |
-| Tap a day with covers | Popup listing that day's books, pages and time |
+| Tap a day with covers | Day popup: covers, titles, pages and time per book |
+| Tap a book in the day popup | Open that book |
 
 You cannot navigate past the current month.
 
@@ -77,6 +81,7 @@ You cannot navigate past the current month.
 
 Long-press the module (SimpleUI module menu):
 
+- **Statistics** — pick which stat columns show in the header strip.
 - **Start week on Monday** — default is Sunday-first, like the screenshot.
 - **Scale** — standard SimpleUI module scaling.
 
