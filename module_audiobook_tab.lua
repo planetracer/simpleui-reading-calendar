@@ -590,22 +590,38 @@ local function registerAction()
     -- The nav bar builds (and loadTabConfig caches its tab list) BEFORE this
     -- registration runs at startup, pruning our then-unknown id — which made
     -- the tab vanish on every KOReader restart. If the saved config contains
-    -- our id, drop the pruned cache and rebuild the bar.
-    pcall(function()
-        local S = require("sui_store")
-        local raw = S:readSetting("simpleui_bar_tabs")
-        if type(raw) ~= "table" then return end
-        local has = false
-        for _i, v in ipairs(raw) do
-            if v == "audiobook_library" then has = true; break end
-        end
-        if not has then return end
-        if Config.saveTabConfig then Config.saveTabConfig(raw) end -- clears cache
-        local FileManager = require("apps/filemanager/filemanager")
-        local fm = FileManager.instance
-        local sp = fm and fm._simpleui_plugin
-        if sp and sp._scheduleRebuild then sp:_scheduleRebuild() end
-    end)
+    -- our id but the live tab list doesn't, drop the pruned cache and force
+    -- a rebuild. The homescreen/file manager may not exist yet this early in
+    -- boot, so retry on a short schedule until one of them can be rebuilt.
+    local function restoreTab()
+        pcall(function()
+            local S = require("sui_store")
+            local raw = S:readSetting("simpleui_bar_tabs")
+            if type(raw) ~= "table" then return end
+            local has = false
+            for _i, v in ipairs(raw) do
+                if v == "audiobook_library" then has = true; break end
+            end
+            if not has then return end
+            local cur = Config.loadTabConfig()
+            for _i, v in ipairs(cur) do
+                if v == "audiobook_library" then return end -- already live
+            end
+            Config.saveTabConfig(raw) -- clears the pruned cache
+            local HS = package.loaded["sui_homescreen"]
+            if HS and HS.rebuildLayout then pcall(HS.rebuildLayout) end
+            local FileManager = package.loaded["apps/filemanager/filemanager"]
+            local fm = FileManager and FileManager.instance
+            local sp = fm and fm._simpleui_plugin
+            if sp and sp._scheduleRebuild then
+                pcall(function() sp:_scheduleRebuild() end)
+            end
+        end)
+    end
+    restoreTab()
+    UIManager:scheduleIn(0.5, restoreTab)
+    UIManager:scheduleIn(2, restoreTab)
+    UIManager:scheduleIn(5, restoreTab)
 end
 
 pcall(registerAction)
