@@ -245,11 +245,26 @@ end
 -- Fullscreen Audiobook Library window
 -- ---------------------------------------------------------------------------
 
+local _open_window  -- the currently shown library view, if any
+
 local showLibrary  -- forward declaration (repage reopens at a new page)
 
 showLibrary = function(start_page)
+    if _open_window then
+        local w = _open_window
+        _open_window = nil
+        pcall(function() UIManager:close(w) end)
+    end
+    local okU, UI = pcall(require, "sui_core")
+    local okC, SConfig = pcall(require, "sui_config")
+    UI = okU and UI or nil
+    SConfig = okC and SConfig or nil
+
     local Style = getStyle()
     local sw, sh = Screen:getWidth(), Screen:getHeight()
+    -- Content area between SimpleUI's top bar and bottom nav bar — the view
+    -- lives inside SimpleUI's chrome, like the Library, not over it.
+    local content_h = (UI and UI.getContentHeight and UI.getContentHeight()) or sh
     local face_reg  = Style and Style.FACE_REGULAR or "cfont"
     local face_bold = Style and Style.FACE_BOLD or "tfont"
     local fs_title = math.max(16, math.floor((Style and Style.FS_TITLE or 22) * 1.2))
@@ -260,7 +275,7 @@ showLibrary = function(start_page)
     local inner_w = sw - 2 * pad
     local row_pad = Size.padding.default
 
-    local th_h = math.floor(sh * 0.11)
+    local th_h = math.floor(content_h * 0.115)
     local th_w = math.floor(th_h / 1.5 + 0.5)
     local row_h = th_h + row_pad
 
@@ -273,9 +288,9 @@ showLibrary = function(start_page)
     local row_face   = Font:getFace(face_bold, fs_row)
     local meta_face  = Font:getFace(face_reg, fs_meta)
 
-    local header_h = math.floor(sh * 0.07)
-    local footer_h = math.floor(sh * 0.06)
-    local list_h = sh - 2 * pad - header_h - footer_h
+    local header_h = math.max(Screen:scaleBySize(36), math.floor(content_h * 0.08))
+    local footer_h = math.floor(content_h * 0.07)
+    local list_h = content_h - pad - header_h - footer_h
     local per_page = math.max(1, math.floor(list_h / (row_h + row_pad)))
     local total_pages = math.max(1, math.ceil(#books / per_page))
 
@@ -445,28 +460,62 @@ showLibrary = function(start_page)
         return content
     end
 
+    -- Inner content widget, sized to the area between top bar and nav bar.
+    local inner = InputContainer:new{
+        dimen = Geom:new{ w = sw, h = content_h },
+        HorizontalGroup:new{
+            align = "top",
+            HorizontalSpan:new{ width = pad },
+            VerticalGroup:new{
+                align = "left",
+                VerticalSpan:new{ width = math.floor(pad / 2) },
+                buildContent(),
+            },
+        },
+    }
+
     window = InputContainer:new{
         dimen = Geom:new{ x = 0, y = 0, w = sw, h = sh },
         covers_fullscreen = true,
-        FrameContainer:new{
-            background = Blitbuffer.COLOR_WHITE,
-            bordersize = 0,
-            padding    = pad,
-            width      = sw,
-            height     = sh,
-            buildContent(),
-        },
     }
+    -- Wrap with SimpleUI's own top bar + bottom nav bar so this reads as a
+    -- native SimpleUI view (tab stays highlighted); plain fullscreen if the
+    -- SimpleUI internals are unavailable.
+    local wrapped_ok = false
+    if UI and UI.wrapWithNavbar then
+        local tabs = SConfig and SConfig.loadTabConfig and SConfig.loadTabConfig() or nil
+        local okw = pcall(function()
+            local nc, wrapped, bar, topbar, bar_idx, tb_on, tb_idx =
+                UI.wrapWithNavbar(inner, "audiobook_library", tabs)
+            if UI.applyNavbarState then
+                UI.applyNavbarState(window, nc, bar, topbar, bar_idx, tb_on, tb_idx, tabs)
+            end
+            window[1] = wrapped
+        end)
+        wrapped_ok = okw and window[1] ~= nil
+    end
+    if not wrapped_ok then
+        window[1] = FrameContainer:new{
+            background = Blitbuffer.COLOR_WHITE,
+            bordersize = 0, padding = 0, margin = 0,
+            width = sw, height = sh,
+            inner,
+        }
+    end
+    function window:onCloseWidget()
+        if _open_window == window then _open_window = nil end
+    end
     window.ges_events = {
         SwipeClose = { GestureRange:new{ ges = "swipe", range = Geom:new{ x = 0, y = 0, w = sw, h = sh } } },
     }
     function window:onSwipeClose(_arg, ges)
-        if ges.direction == "south" or ges.direction == "east" then
+        if ges.direction == "south" then
             UIManager:close(window)
             return true
         end
         return false
     end
+    _open_window = window
     UIManager:show(window, "full")
 end
 
@@ -492,6 +541,20 @@ local function registerAction()
         icon    = icon,
         execute = function(_ctx) showLibrary() end,
     })
+    -- Close the library view whenever another tab/action executes, so
+    -- tapping Home/Library/etc. in the nav bar behaves like leaving a tab.
+    if not QA._audiobook_tab_hooked then
+        QA._audiobook_tab_hooked = true
+        local orig_execute = QA.execute
+        QA.execute = function(id, ctx)
+            if _open_window and id ~= "audiobook_library" then
+                local w = _open_window
+                _open_window = nil
+                pcall(function() UIManager:close(w) end)
+            end
+            return orig_execute(id, ctx)
+        end
+    end
     -- Also list it in the action catalogue so it appears in the
     -- Tabs / Arrange Tabs pools alongside the built-ins.
     if Config.ALL_ACTIONS and Config.ACTION_BY_ID
