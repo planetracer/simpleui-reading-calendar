@@ -247,6 +247,49 @@ end
 
 local _open_window  -- the currently shown library view, if any
 
+-- Sort modes for the library view (persisted in SimpleUI settings).
+local SORT_KEY = "simpleui_hs_rcab_tab_sort"
+local SORT_NEXT = { series = "author", author = "title", title = "series" }
+
+local function getSortMode()
+    local m
+    pcall(function()
+        local S = require("sui_store")
+        m = S:readSetting(SORT_KEY)
+    end)
+    if m ~= "series" and m ~= "author" and m ~= "title" then m = "series" end
+    return m
+end
+
+local function setSortMode(m)
+    pcall(function()
+        local S = require("sui_store")
+        S:set(SORT_KEY, m)
+    end)
+end
+
+local function sortLabel(m)
+    if m == "author" then return _("Author") end
+    if m == "title" then return _("Title") end
+    return _("Series")
+end
+
+local function sortBooks(books, mode)
+    table.sort(books, function(a, b)
+        if mode == "title" then
+            return (a.title or "") < (b.title or "")
+        elseif mode == "author" then
+            local aa, ab = a.author or "\255", b.author or "\255"
+            if aa ~= ab then return aa < ab end
+        end
+        local sa, sb = a.series or "\255", b.series or "\255"
+        if sa ~= sb then return sa < sb end
+        local ia, ib = a.series_index or 0, b.series_index or 0
+        if ia ~= ib then return ia < ib end
+        return (a.title or "") < (b.title or "")
+    end)
+end
+
 local showLibrary  -- forward declaration (repage reopens at a new page)
 
 showLibrary = function(start_page)
@@ -275,187 +318,161 @@ showLibrary = function(start_page)
     local inner_w = sw - 2 * pad
     local row_pad = Size.padding.default
 
-    local th_h = math.floor(content_h * 0.115)
-    local th_w = math.floor(th_h / 1.5 + 0.5)
-    local row_h = th_h + row_pad
-
     local books = scanBooks()
+    local sort_mode = getSortMode()
+    sortBooks(books, sort_mode)
     local page = start_page or 1
 
     local window  -- forward declaration
 
     local head_face  = Font:getFace(face_bold, fs_title)
-    local row_face   = Font:getFace(face_bold, fs_row)
+    local band_face  = Font:getFace(face_bold, math.max(11, fs_meta + 2))
     local meta_face  = Font:getFace(face_reg, fs_meta)
 
-    local header_h = math.max(Screen:scaleBySize(36), math.floor(content_h * 0.08))
-    local footer_h = math.floor(content_h * 0.07)
-    local list_h = content_h - pad - header_h - footer_h
-    local per_page = math.max(1, math.floor(list_h / (row_h + row_pad)))
+    -- Library-style grid: 3 large covers per row, like the file browser.
+    local cols = 3
+    local gap  = math.max(6, Screen:scaleBySize(10))
+    local cover_w = math.floor((inner_w - (cols - 1) * gap) / cols)
+    local cover_h = math.floor(cover_w * 1.5)
+
+    local header_block_h = math.max(Screen:scaleBySize(44), math.floor(content_h * 0.09))
+    local list_h = content_h - pad - header_block_h
+    local grid_rows = math.max(1, math.floor(list_h / (cover_h + gap)))
+    local per_page = cols * grid_rows
     local total_pages = math.max(1, math.ceil(#books / per_page))
+    if page > total_pages then page = total_pages end
+
+    -- One grid cell: big cover with a library-style centered title band,
+    -- a % badge top-right and a thin progress bar near the bottom.
+    local function makeCell(b)
+        local og = OverlapGroup:new{
+            dimen = Geom:new{ w = cover_w, h = cover_h },
+            allow_mirroring = false,
+        }
+        og[#og + 1] = coverWidget(b, cover_w, cover_h)
+        local band_pad = math.max(3, Screen:scaleBySize(4))
+        local band_text = makeText(b.title, band_face, Blitbuffer.COLOR_BLACK,
+            true, cover_w - 4 * band_pad)
+        local band = FrameContainer:new{
+            background = Blitbuffer.COLOR_WHITE,
+            bordersize = 0, margin = 0, padding = band_pad,
+            CenterContainer:new{
+                dimen = Geom:new{ w = cover_w - 2 * band_pad, h = band_text:getSize().h },
+                band_text,
+            },
+        }
+        band.overlap_offset = { 0, math.floor((cover_h - band:getSize().h) / 2) }
+        og[#og + 1] = band
+        local secs = listenedSeconds(b.file)
+        if secs and b.duration and b.duration > 0 then
+            local pct = math.floor(100 * math.min(1, secs / b.duration) + 0.5)
+            local btxt = makeText(pct .. "%", meta_face, Blitbuffer.COLOR_BLACK, true)
+            local badge = FrameContainer:new{
+                background = Blitbuffer.COLOR_WHITE,
+                bordersize = Size.border.thin, margin = 0,
+                padding = math.max(2, Screen:scaleBySize(3)),
+                btxt,
+            }
+            local bs = badge:getSize()
+            badge.overlap_offset = { cover_w - bs.w - Screen:scaleBySize(4), Screen:scaleBySize(4) }
+            og[#og + 1] = badge
+            local bar = progressBar(b, cover_w - 2 * band_pad)
+            if bar then
+                bar.overlap_offset = { band_pad, cover_h - Screen:scaleBySize(9) }
+                og[#og + 1] = bar
+            end
+        end
+        local cell = InputContainer:new{
+            dimen = Geom:new{ w = cover_w, h = cover_h },
+            og,
+        }
+        cell.ges_events = {
+            TapBook = { GestureRange:new{ ges = "tap", range = function() return cell.dimen end } },
+        }
+        local _b = b
+        function cell:onTapBook()
+            local ap = findAudiobookPlugin()
+            if ap and type(ap._playAudioFile) == "function" then
+                UIManager:close(window)
+                local okp, err = pcall(function() ap:_playAudioFile(_b.file) end)
+                if not okp then
+                    logger.warn("audiobook_tab: play failed: " .. tostring(err))
+                end
+            else
+                UIManager:show(require("ui/widget/infomessage"):new{
+                    text = _("Audiobook player not installed.\n\nInstall audiobook.koplugin to play; this tab organizes the library."),
+                })
+            end
+            return true
+        end
+        return cell
+    end
 
     local function buildContent()
         local content = VerticalGroup:new{ align = "left" }
 
-        -- ── Header: title + count, close X on the right ──
-        local title_w = makeText(_("AUDIOBOOKS"), head_face,
+        -- ── Header: centered title + page line, sort toggle on the right ──
+        local title_w = makeText(_("Audiobooks"), head_face,
             Blitbuffer.COLOR_BLACK, true)
-        local count_w = makeText(string.format("%d", #books), meta_face,
-            Blitbuffer.COLOR_DARK_GRAY)
-        local close_w = makeText("✕", head_face, Blitbuffer.COLOR_BLACK, true)
-        local close_box = InputContainer:new{
-            dimen = Geom:new{ w = header_h, h = header_h },
+        local page_w = makeText(
+            string.format(_("Page %d of %d"), page, total_pages),
+            meta_face, Blitbuffer.COLOR_DARK_GRAY)
+        local head_stack = VerticalGroup:new{ align = "center", title_w, page_w }
+        local sort_w = makeText(_("Sort") .. ": " .. sortLabel(sort_mode),
+            meta_face, Blitbuffer.COLOR_BLACK)
+        local sort_box_w = sort_w:getSize().w + row_pad
+        local sort_box = InputContainer:new{
+            dimen = Geom:new{ w = sort_box_w, h = header_block_h },
             CenterContainer:new{
-                dimen = Geom:new{ w = header_h, h = header_h },
-                close_w,
+                dimen = Geom:new{ w = sort_box_w, h = header_block_h },
+                sort_w,
             },
         }
-        close_box.ges_events = {
-            TapX = { GestureRange:new{ ges = "tap", range = function() return close_box.dimen end } },
+        sort_box.ges_events = {
+            TapSort = { GestureRange:new{ ges = "tap", range = function() return sort_box.dimen end } },
         }
-        function close_box:onTapX()
-            UIManager:close(window)
+        function sort_box:onTapSort()
+            setSortMode(SORT_NEXT[sort_mode] or "series")
+            showLibrary(1)
             return true
         end
-        local head_left = HorizontalGroup:new{
-            align = "center",
-            title_w,
-            HorizontalSpan:new{ width = row_pad },
-            count_w,
-        }
-        local hl_w = head_left:getSize().w
-        local header = HorizontalGroup:new{
-            align = "center",
-            LeftContainer:new{
-                dimen = Geom:new{ w = inner_w - header_h, h = header_h },
-                head_left,
+        local header = OverlapGroup:new{
+            dimen = Geom:new{ w = inner_w, h = header_block_h },
+            allow_mirroring = false,
+            CenterContainer:new{
+                dimen = Geom:new{ w = inner_w, h = header_block_h },
+                head_stack,
             },
-            close_box,
         }
+        sort_box.overlap_offset = { inner_w - sort_box_w, 0 }
+        header[#header + 1] = sort_box
         content[#content + 1] = header
 
-        -- ── Book rows ──
+        -- ── Cover grid ──
         local first = (page - 1) * per_page + 1
         local last = math.min(#books, first + per_page - 1)
-        local rows = {}
-        for i = first, last do
-            local b = books[i]
-            local text_w = inner_w - th_w - row_pad
-            local col = VerticalGroup:new{ align = "left" }
-            col[#col + 1] = makeText(b.title, row_face,
-                Blitbuffer.COLOR_BLACK, true, text_w)
-            if b.author then
-                col[#col + 1] = makeText(b.author, meta_face,
-                    Blitbuffer.COLOR_DARK_GRAY, false, text_w)
+        local i = first
+        for _r = 1, grid_rows do
+            if i > last then break end
+            local hrow = HorizontalGroup:new{ align = "top" }
+            for c = 1, cols do
+                if i > last then break end
+                if c > 1 then hrow[#hrow + 1] = HorizontalSpan:new{ width = gap } end
+                hrow[#hrow + 1] = makeCell(books[i])
+                i = i + 1
             end
-            local detail = {}
-            if b.series then
-                detail[#detail + 1] = b.series
-                    .. (b.series_index and (" #" .. tostring(b.series_index)) or "")
-            end
-            if b.duration and b.duration > 0 then
-                detail[#detail + 1] = fmtDuration(b.duration)
-            end
-            local secs = listenedSeconds(b.file)
-            if secs and b.duration and b.duration > 0 then
-                detail[#detail + 1] = string.format(_("%d%% listened"),
-                    math.floor(100 * math.min(1, secs / b.duration) + 0.5))
-            end
-            if #detail > 0 then
-                col[#col + 1] = makeText(table.concat(detail, " · "),
-                    meta_face, Blitbuffer.COLOR_DARK_GRAY, false, text_w)
-            end
-            local bar = progressBar(b, text_w)
-            if bar then
-                col[#col + 1] = VerticalSpan:new{ width = math.floor(row_pad / 2) }
-                col[#col + 1] = bar
-            end
-
-            local hg = HorizontalGroup:new{
-                align = "center",
-                coverWidget(b, th_w, th_h),
-                HorizontalSpan:new{ width = row_pad },
-                col,
-            }
-            local row = InputContainer:new{
-                dimen = Geom:new{ w = inner_w, h = row_h },
-                LeftContainer:new{
-                    dimen = Geom:new{ w = inner_w, h = row_h },
-                    hg,
-                },
-            }
-            local _b = b
-            row.ges_events = {
-                TapBook = { GestureRange:new{ ges = "tap", range = function() return row.dimen end } },
-            }
-            function row:onTapBook()
-                local ap = findAudiobookPlugin()
-                if ap and type(ap._playAudioFile) == "function" then
-                    UIManager:close(window)
-                    local okp, err = pcall(function() ap:_playAudioFile(_b.file) end)
-                    if not okp then
-                        logger.warn("audiobook_tab: play failed: " .. tostring(err))
-                    end
-                else
-                    UIManager:show(require("ui/widget/infomessage"):new{
-                        text = _("Audiobook player not installed.\n\nInstall audiobook.koplugin to play; this tab organizes the library."),
-                    })
-                end
-                return true
-            end
-            rows[#rows + 1] = row
-            content[#content + 1] = row
-            content[#content + 1] = VerticalSpan:new{ width = row_pad }
+            content[#content + 1] = hrow
+            content[#content + 1] = VerticalSpan:new{ width = gap }
         end
 
         if #books == 0 then
             content[#content + 1] = VerticalSpan:new{ width = row_pad * 2 }
-            content[#content + 1] = makeText(
-                _("No audiobooks yet."),
-                row_face, Blitbuffer.COLOR_DARK_GRAY, true, inner_w)
+            content[#content + 1] = makeText(_("No audiobooks yet."),
+                band_face, Blitbuffer.COLOR_DARK_GRAY, true, inner_w)
             content[#content + 1] = VerticalSpan:new{ width = row_pad }
             content[#content + 1] = makeText(
                 _("Create books with the Audiobook Maker app, then send via USB or Wi-Fi sync."),
                 meta_face, Blitbuffer.COLOR_DARK_GRAY, false, inner_w)
-        end
-
-        -- ── Footer: page navigation ──
-        if total_pages > 1 then
-            local prev_w = makeText("‹", head_face,
-                page > 1 and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY, true)
-            local page_w = makeText(string.format("%d / %d", page, total_pages),
-                meta_face, Blitbuffer.COLOR_DARK_GRAY)
-            local next_w = makeText("›", head_face,
-                page < total_pages and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_GRAY, true)
-            local third = math.floor(inner_w / 3)
-            local prev_box = InputContainer:new{
-                dimen = Geom:new{ w = third, h = footer_h },
-                CenterContainer:new{ dimen = Geom:new{ w = third, h = footer_h }, prev_w },
-            }
-            local next_box = InputContainer:new{
-                dimen = Geom:new{ w = third, h = footer_h },
-                CenterContainer:new{ dimen = Geom:new{ w = third, h = footer_h }, next_w },
-            }
-            prev_box.ges_events = {
-                TapPrev = { GestureRange:new{ ges = "tap", range = function() return prev_box.dimen end } },
-            }
-            next_box.ges_events = {
-                TapNext = { GestureRange:new{ ges = "tap", range = function() return next_box.dimen end } },
-            }
-            local function repage(delta)
-                local np = page + delta
-                if np < 1 or np > total_pages then return end
-                UIManager:close(window)
-                showLibrary(np)
-            end
-            function prev_box:onTapPrev() repage(-1); return true end
-            function next_box:onTapNext() repage(1); return true end
-            content[#content + 1] = HorizontalGroup:new{
-                align = "center",
-                prev_box,
-                CenterContainer:new{ dimen = Geom:new{ w = third, h = footer_h }, page_w },
-                next_box,
-            }
         end
         return content
     end
@@ -512,6 +529,12 @@ showLibrary = function(start_page)
         if ges.direction == "south" then
             UIManager:close(window)
             return true
+        elseif ges.direction == "west" then
+            if page < total_pages then showLibrary(page + 1) end
+            return true
+        elseif ges.direction == "east" then
+            if page > 1 then showLibrary(page - 1) end
+            return true
         end
         return false
     end
@@ -563,6 +586,25 @@ local function registerAction()
         Config.ALL_ACTIONS[#Config.ALL_ACTIONS + 1] = desc
         Config.ACTION_BY_ID.audiobook_library = desc
     end
+    -- The nav bar builds (and loadTabConfig caches its tab list) BEFORE this
+    -- registration runs at startup, pruning our then-unknown id — which made
+    -- the tab vanish on every KOReader restart. If the saved config contains
+    -- our id, drop the pruned cache and rebuild the bar.
+    pcall(function()
+        local S = require("sui_store")
+        local raw = S:readSetting("simpleui_bar_tabs")
+        if type(raw) ~= "table" then return end
+        local has = false
+        for _i, v in ipairs(raw) do
+            if v == "audiobook_library" then has = true; break end
+        end
+        if not has then return end
+        if Config.saveTabConfig then Config.saveTabConfig(raw) end -- clears cache
+        local FileManager = require("apps/filemanager/filemanager")
+        local fm = FileManager.instance
+        local sp = fm and fm._simpleui_plugin
+        if sp and sp._scheduleRebuild then sp:_scheduleRebuild() end
+    end)
 end
 
 pcall(registerAction)
