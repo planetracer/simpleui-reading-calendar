@@ -48,6 +48,17 @@ function ReadingCalendarPlugin:_register()
     end
 end
 
+-- Invoked by the "Audiobooks" custom quick action (SimpleUI tab): opens
+-- the fullscreen audiobook library from module_audiobook_tab.lua.
+function ReadingCalendarPlugin:openAudiobookLibrary()
+    for _i, mod in ipairs(self._modules or {}) do
+        if type(mod.showLibrary) == "function" then
+            pcall(mod.showLibrary)
+            return true
+        end
+    end
+end
+
 -- Refresh cached data when a book is closed (today's stats, new files).
 function ReadingCalendarPlugin:onCloseDocument()
     for _i, mod in ipairs(self._modules or {}) do

@@ -246,7 +246,8 @@ end
 -- Fullscreen Audiobook Library window
 -- ---------------------------------------------------------------------------
 
-local _open_window  -- the currently shown library view, if any
+local _open_window   -- the currently shown library view, if any
+local _tab_action_id -- the custom_qa_N id backing the Audiobooks tab
 
 -- Sort modes for the library view (persisted in SimpleUI settings).
 local SORT_KEY = "simpleui_hs_rcab_tab_sort"
@@ -504,7 +505,7 @@ showLibrary = function(start_page)
         local tabs = SConfig and SConfig.loadTabConfig and SConfig.loadTabConfig() or nil
         local okw = pcall(function()
             local nc, wrapped, bar, topbar, bar_idx, tb_on, tb_idx =
-                UI.wrapWithNavbar(inner, "audiobook_library", tabs)
+                UI.wrapWithNavbar(inner, _tab_action_id or "audiobook_library", tabs)
             if UI.applyNavbarState then
                 UI.applyNavbarState(window, nc, bar, topbar, bar_idx, tb_on, tb_idx, tabs)
             end
@@ -544,34 +545,102 @@ showLibrary = function(start_page)
 end
 
 -- ---------------------------------------------------------------------------
--- Register the SimpleUI action (runs once at plugin load)
+-- Tab wiring (runs once at plugin load)
+--
+-- The tab is a SimpleUI *custom quick action* bound to the wrapper
+-- plugin's openAudiobookLibrary() method. Registered actions get pruned
+-- from the saved tab list whenever the bar builds before registration
+-- (i.e. every boot), but custom_qa_N ids are exempt from that pruning —
+-- so a custom QA survives KOReader restarts with no timing races.
 -- ---------------------------------------------------------------------------
 
-local function registerAction()
-    local okQA, QA = pcall(require, "sui_quickactions")
+local function readQAConfig(S, id)
+    local cfg
+    pcall(function()
+        if S.get then cfg = S:get("simpleui_qa_" .. id) end
+        if cfg == nil and S.readSetting then cfg = S:readSetting("simpleui_qa_" .. id) end
+    end)
+    return cfg
+end
+
+local function ensureTab()
     local okC, Config = pcall(require, "sui_config")
-    if not (okQA and QA and QA.register and okC and Config) then
-        logger.warn("audiobook_tab: SimpleUI QA/Config unavailable; tab not registered")
+    local okS, S = pcall(require, "sui_store")
+    local okQA, QA = pcall(require, "sui_quickactions")
+    if not (okC and Config and okS and S) then
+        logger.warn("audiobook_tab: SimpleUI unavailable; tab not installed")
         return
     end
-    local icon = Config.ICON.collections
-    if _this_dir then
-        local custom = _this_dir .. "/icon_audiobooks.svg"
-        if lfs.attributes(custom, "mode") == "file" then icon = custom end
+
+    -- 1. Find or create the custom quick action for the library.
+    local list = (Config.getCustomQAList and Config.getCustomQAList()) or {}
+    for _i, id in ipairs(list) do
+        local cfg = readQAConfig(S, id)
+        if cfg and cfg.plugin_key == "readingcalendar"
+            and cfg.plugin_method == "openAudiobookLibrary" then
+            _tab_action_id = id
+            break
+        end
     end
-    QA.register({
-        id      = "audiobook_library",
-        label   = _("Audiobooks"),
-        icon    = icon,
-        execute = function(_ctx) showLibrary() end,
-    })
-    -- Close the library view whenever another tab/action executes, so
-    -- tapping Home/Library/etc. in the nav bar behaves like leaving a tab.
-    if not QA._audiobook_tab_hooked then
+    if not _tab_action_id and Config.nextCustomQAId and Config.saveCustomQAList
+        and Config.saveCustomQAConfig then
+        local nid = Config.nextCustomQAId()
+        if nid then
+            local icon = Config.CUSTOM_PLUGIN_ICON
+            if _this_dir then
+                local custom = _this_dir .. "/icon_audiobooks.svg"
+                if lfs.attributes(custom, "mode") == "file" then icon = custom end
+            end
+            list[#list + 1] = nid
+            Config.saveCustomQAList(list)
+            Config.saveCustomQAConfig(nid, _("Audiobooks"), nil, nil, icon,
+                "readingcalendar", "openAudiobookLibrary", nil, nil)
+            _tab_action_id = nid
+        end
+    end
+    if not _tab_action_id then return end
+
+    -- 2. Seed it into the tab bar once. If the user removes the tab later,
+    --    the seeded flag stops us from forcing it back.
+    pcall(function()
+        if S:isTrue("simpleui_rcab_tab_seeded") then return end
+        local raw = S:readSetting("simpleui_bar_tabs")
+        if type(raw) ~= "table" then
+            raw = {}
+            for _i, v in ipairs(Config.loadTabConfig()) do raw[#raw + 1] = v end
+        end
+        for _i, v in ipairs(raw) do
+            if v == _tab_action_id then
+                S:set("simpleui_rcab_tab_seeded", true)
+                return
+            end
+        end
+        local max_tabs = (Config.effectiveMaxTabs and Config.effectiveMaxTabs()) or 6
+        if #raw >= max_tabs then
+            -- Bar is full — leave it to the user (the action shows up in
+            -- the Simple UI → Tabs pool either way).
+            S:set("simpleui_rcab_tab_seeded", true)
+            return
+        end
+        -- Insert before "power" when present, else append.
+        local pos = #raw + 1
+        for i, v in ipairs(raw) do
+            if v == "power" then pos = i; break end
+        end
+        table.insert(raw, pos, _tab_action_id)
+        Config.saveTabConfig(raw)
+        S:set("simpleui_rcab_tab_seeded", true)
+        local HS = package.loaded["sui_homescreen"]
+        if HS and HS.rebuildLayout then pcall(HS.rebuildLayout) end
+    end)
+
+    -- 3. Close the library view whenever a different tab/action executes,
+    --    so nav-bar taps behave like normal tab switches.
+    if okQA and QA and QA.execute and not QA._audiobook_tab_hooked then
         QA._audiobook_tab_hooked = true
         local orig_execute = QA.execute
         QA.execute = function(id, ctx)
-            if _open_window and id ~= "audiobook_library" then
+            if _open_window and id ~= _tab_action_id then
                 local w = _open_window
                 _open_window = nil
                 pcall(function() UIManager:close(w) end)
@@ -579,62 +648,27 @@ local function registerAction()
             return orig_execute(id, ctx)
         end
     end
-    -- Also list it in the action catalogue so it appears in the
-    -- Tabs / Arrange Tabs pools alongside the built-ins.
-    if Config.ALL_ACTIONS and Config.ACTION_BY_ID
-        and not Config.ACTION_BY_ID.audiobook_library then
-        local desc = { id = "audiobook_library", label = _("Audiobooks"), icon = icon }
-        Config.ALL_ACTIONS[#Config.ALL_ACTIONS + 1] = desc
-        Config.ACTION_BY_ID.audiobook_library = desc
-    end
-    -- The nav bar builds (and loadTabConfig caches its tab list) BEFORE this
-    -- registration runs at startup, pruning our then-unknown id — which made
-    -- the tab vanish on every KOReader restart. If the saved config contains
-    -- our id but the live tab list doesn't, drop the pruned cache and force
-    -- a rebuild. The homescreen/file manager may not exist yet this early in
-    -- boot, so retry on a short schedule until one of them can be rebuilt.
-    local function restoreTab()
-        pcall(function()
-            local S = require("sui_store")
-            local raw = S:readSetting("simpleui_bar_tabs")
-            if type(raw) ~= "table" then return end
-            local has = false
-            for _i, v in ipairs(raw) do
-                if v == "audiobook_library" then has = true; break end
-            end
-            if not has then return end
-            local cur = Config.loadTabConfig()
-            for _i, v in ipairs(cur) do
-                if v == "audiobook_library" then return end -- already live
-            end
-            Config.saveTabConfig(raw) -- clears the pruned cache
-            local HS = package.loaded["sui_homescreen"]
-            if HS and HS.rebuildLayout then pcall(HS.rebuildLayout) end
-            local FileManager = package.loaded["apps/filemanager/filemanager"]
-            local fm = FileManager and FileManager.instance
-            local sp = fm and fm._simpleui_plugin
-            if sp and sp._scheduleRebuild then
-                pcall(function() sp:_scheduleRebuild() end)
-            end
-        end)
-    end
-    restoreTab()
-    UIManager:scheduleIn(0.5, restoreTab)
-    UIManager:scheduleIn(2, restoreTab)
-    UIManager:scheduleIn(5, restoreTab)
 end
 
-pcall(registerAction)
+pcall(ensureTab)
+-- SimpleUI may not be fully initialized when the wrapper dofiles this at
+-- boot — retry once things settle.
+UIManager:scheduleIn(2, function()
+    if not _tab_action_id then pcall(ensureTab) end
+end)
 
 -- ---------------------------------------------------------------------------
--- Homescreen-module shim (keeps the wrapper's registry happy; never shown)
+-- Homescreen-module shim (keeps the wrapper's registry happy; never shown).
+-- showLibrary is exported so the wrapper's openAudiobookLibrary() — the
+-- method the custom quick action invokes — can open the view.
 -- ---------------------------------------------------------------------------
 
 return {
-    id         = "audiobook_library_tab",
-    name       = _("Audiobooks Tab"),
-    description = _("Adds the Audiobooks tab action (enable it under Simple UI → Tabs)"),
-    default_on = false,
-    isEnabled  = function() return false end,
-    build      = function() return nil end,
+    id          = "audiobook_library_tab",
+    name        = _("Audiobooks Tab"),
+    description = _("Backs the Audiobooks nav-bar tab"),
+    default_on  = false,
+    isEnabled   = function() return false end,
+    build       = function() return nil end,
+    showLibrary = function() showLibrary() end,
 }
