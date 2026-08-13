@@ -1,21 +1,19 @@
--- main.lua — SimpleUI extra modules (standalone wrapper)
+-- main.lua — Reading Calendar (standalone wrapper)
 --
--- Registers every module_*.lua in this folder with SimpleUI's module
--- registry (Reading Calendar, Audiobook Shelf, …).
+-- Registers module_reading_calendar.lua with SimpleUI's module registry.
 -- Use this plugin when you have SimpleUI but NOT simpleui_ext installed.
--- (With simpleui_ext, just drop the module files into its modules/
--- folder instead — do not install both.)
+-- (With simpleui_ext, just drop module_reading_calendar.lua into its
+-- modules/ folder instead — do not install both.)
 
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local UIManager       = require("ui/uimanager")
-local lfs             = require("libs/libkoreader-lfs")
 local logger          = require("logger")
 
 local ReadingCalendarPlugin = WidgetContainer:extend{
     name        = "readingcalendar",
     is_doc_only = false,
     _registry   = nil,
-    _modules    = nil,
+    _module     = nil,
 }
 
 function ReadingCalendarPlugin:init()
@@ -32,50 +30,29 @@ function ReadingCalendarPlugin:_register()
                     "make sure the SimpleUI plugin is installed.")
         return
     end
+    local ok_mod, mod = pcall(dofile, self.path .. "/module_reading_calendar.lua")
+    if not ok_mod or type(mod) ~= "table" then
+        logger.warn("readingcalendar: failed to load module: " .. tostring(mod))
+        return
+    end
+    Registry.register(mod)
     self._registry = Registry
-    self._modules  = {}
-    for entry in lfs.dir(self.path) do
-        if entry:match("^module_.+%.lua$") then
-            local ok_mod, mod = pcall(dofile, self.path .. "/" .. entry)
-            if ok_mod and type(mod) == "table" and mod.id then
-                Registry.register(mod)
-                self._modules[#self._modules + 1] = mod
-            else
-                logger.warn("readingcalendar: failed to load " .. entry ..
-                            ": " .. tostring(mod))
-            end
-        end
-    end
+    self._module   = mod
 end
 
--- Invoked by the "Audiobooks" custom quick action (SimpleUI tab): opens
--- the fullscreen audiobook library from module_audiobook_tab.lua.
-function ReadingCalendarPlugin:openAudiobookLibrary()
-    for _i, mod in ipairs(self._modules or {}) do
-        if type(mod.showLibrary) == "function" then
-            pcall(mod.showLibrary)
-            return true
-        end
-    end
-end
-
--- Refresh cached data when a book is closed (today's stats, new files).
+-- Refresh stats when a book is closed so the calendar shows today's session.
 function ReadingCalendarPlugin:onCloseDocument()
-    for _i, mod in ipairs(self._modules or {}) do
-        if type(mod.invalidateCache) == "function" then
-            pcall(mod.invalidateCache)
-        end
+    if self._module and type(self._module.invalidateCache) == "function" then
+        self._module.invalidateCache()
     end
 end
 
 function ReadingCalendarPlugin:onClosePlugin()
-    if self._registry and self._modules then
-        for _i, mod in ipairs(self._modules) do
-            pcall(self._registry.unregister, mod.id)
-        end
+    if self._registry and self._module then
+        self._registry.unregister(self._module.id)
     end
     self._registry = nil
-    self._modules  = nil
+    self._module   = nil
 end
 
 return ReadingCalendarPlugin
